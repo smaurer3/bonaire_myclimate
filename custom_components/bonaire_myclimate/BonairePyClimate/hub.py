@@ -222,6 +222,12 @@ class Hub:
                 self.preset_modes = self._preset_modes_cool
                 self.supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
                 self.target_temperature = int(self._zone_info["setPoint"])
+            elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
+                self.fan_mode = self._zone_info["setPoint"]
+                self.fan_modes = FAN_MODES_EVAP
+                self.hvac_mode = HVACMode.COOL
+                self.preset_modes = self._preset_modes_evap
+                self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
             elif self._zone_info["type"] == "evap":
                 self.fan_mode = self._zone_info["fanSpeed"]
                 self.fan_modes = FAN_MODES_EVAP
@@ -255,6 +261,9 @@ class Hub:
         """Set new target fan operation."""
         if self._zone_info["mode"] == "fan":
             command = {"fanSpeed": fan_mode}
+        elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
+            command = {"setPoint": fan_mode}
+            command["mode"] = "thermo"            
         elif self._zone_info["type"] == "evap":
             command = {"fanSpeed": fan_mode}
             if int(fan_mode) < 8:
