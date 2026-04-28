@@ -42,7 +42,6 @@ class Hub:
         self.available = False
         self.current_temperature = None
         self.fan_mode = None
-        self.evap_mode = None
         self.fan_modes = None
         self.hvac_mode = None
         self.hvac_modes = None
@@ -224,27 +223,27 @@ class Hub:
                 self.supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
                 self.target_temperature = int(self._zone_info["setPoint"])
             elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
-                self.evap_mode = self._zone_info["mode"]
                 self.fan_mode = self._zone_info["setPoint"]
                 self.fan_modes = FAN_MODES_EVAP
                 self.hvac_mode = HVACMode.COOL
-                self.preset_modes = self._preset_modes_evap
+                self.preset_modes = ["thermo", "manual", "boost"]
                 self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
             elif self._zone_info["type"] == "evap":
-                self.evap_mode = self._zone_info["mode"]
                 self.fan_mode = self._zone_info["fanSpeed"]
                 self.fan_modes = FAN_MODES_EVAP
                 self.hvac_mode = HVACMode.COOL
-                self.preset_modes = self._preset_modes_evap
+                self.preset_modes = ["thermo", "manual", "boost"]
                 self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
 
             self.current_temperature = int(self._zone_info["roomTemp"])
-            self.preset_mode = self._zone_info["zoneList"]
+            if self._zone_info.get("type") == "evap":
+                self.preset_mode = self._zone_info["mode"]
+            else:
+                self.preset_mode = self._zone_info["zoneList"]
 
             self.available = True
             self._ready = True
             self._hass.loop.create_task(self.publish_updates())
-
 
         # Check if the message is postzoneinfo result 'ok'
         elif (root.findtext("response") == "postzoneinfo" and
@@ -266,7 +265,7 @@ class Hub:
             command = {"fanSpeed": fan_mode}
         elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
             command = {"setPoint": fan_mode}
-            command["mode"] = "thermo"            
+            command["mode"] = "thermo"
         elif self._zone_info["type"] == "evap":
             command = {"fanSpeed": fan_mode}
             if int(fan_mode) < 8:
@@ -319,7 +318,10 @@ class Hub:
 
     async def async_set_preset_mode(self, preset_mode):
         """Set new target preset mode."""
-        command = {"zoneList": preset_mode}
+        if self._zone_info.get("type") == "evap":
+            command = {"type": "evap", "mode": preset_mode}
+        else:
+            command = {"zoneList": preset_mode}
         await self.async_send_commands(command)
 
     async def async_set_temperature(self, temperature):
