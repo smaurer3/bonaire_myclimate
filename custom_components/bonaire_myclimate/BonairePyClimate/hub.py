@@ -42,6 +42,7 @@ class Hub:
         self.available = False
         self.current_temperature = None
         self.fan_mode = None
+        self.evap_mode = None
         self.fan_modes = None
         self.hvac_mode = None
         self.hvac_modes = None
@@ -223,12 +224,14 @@ class Hub:
                 self.supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
                 self.target_temperature = int(self._zone_info["setPoint"])
             elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
+                self.evap_mode = self._zone_info["mode"]
                 self.fan_mode = self._zone_info["setPoint"]
                 self.fan_modes = FAN_MODES_EVAP
                 self.hvac_mode = HVACMode.COOL
                 self.preset_modes = self._preset_modes_evap
                 self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
             elif self._zone_info["type"] == "evap":
+                self.evap_mode = self._zone_info["mode"]
                 self.fan_mode = self._zone_info["fanSpeed"]
                 self.fan_modes = FAN_MODES_EVAP
                 self.hvac_mode = HVACMode.COOL

@@ -124,6 +124,13 @@ class BonaireMyClimateClimate(ClimateEntity):
     def target_temperature(self):
         """Return the temperature we try to reach."""
         return self._hub.target_temperature
+    
+    @property
+    def extra_state_attributes(self):
+        """Return extra state attributes."""
+        if self._hub.evap_mode is not None:
+            return {"evap_mode": self._hub.evap_mode}
+        return {}
 
     @property
     def target_temperature_step(self):
