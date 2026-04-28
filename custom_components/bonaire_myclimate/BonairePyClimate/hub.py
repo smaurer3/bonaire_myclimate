@@ -29,6 +29,7 @@ class Hub:
         self._connected = False # When there is an open TCP connection
         self._enable_turn_on_off_backwards_compatibility = False
         self._fan_mode_memory_heat = "thermo"
+        self._fan_mode_memory_evap = "manual"
         self._postzoneinfo_response_ok = False
         self._queued_commands = []
         self._ready = False # Ready to send commands
@@ -223,12 +224,14 @@ class Hub:
                 self.supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
                 self.target_temperature = int(self._zone_info["setPoint"])
             elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
+                self._fan_mode_memory_evap = "thermo"
                 self.fan_mode = self._zone_info["setPoint"]
                 self.fan_modes = FAN_MODES_EVAP
                 self.hvac_mode = HVACMode.COOL
                 self.preset_modes = ["thermo", "manual", "boost"]
                 self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
             elif self._zone_info["type"] == "evap":
+                self._fan_mode_memory_evap = self._zone_info["mode"]
                 self.fan_mode = self._zone_info["fanSpeed"]
                 self.fan_modes = FAN_MODES_EVAP
                 self.hvac_mode = HVACMode.COOL
@@ -304,7 +307,8 @@ class Hub:
             elif self._appliances["evap"] is not None:
                 commands = {
                     "system": "on",
-                    "type": "evap"
+                    "type": "evap",
+                    "mode": self._fan_mode_memory_evap
                 }
 
         await self.async_send_commands(commands)
