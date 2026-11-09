@@ -42,7 +42,9 @@ class Hub:
         self._enable_turn_on_off_backwards_compatibility = False
         self._fan_mode_memory_heat = "thermo"
         self._fan_mode_memory_evap = "manual"
-        self._postzoneinfo_response_ok = False
+        self._last_summary = None
+        self._post_acked = asyncio.Event()  # unit answered our postzoneinfo with result ok
+        self._zone_refreshed = asyncio.Event()  # unit answered our getzoneinfo
         self._queued_commands = []
         self._ready = False # Ready to send commands
         self._start_task = None
@@ -185,7 +187,11 @@ class Hub:
         message = data.decode()
         _LOGGER.info("Server data received")
         _LOGGER.debug(f"Received: {message}")
-        root = xml.etree.ElementTree.fromstring(message)
+        try:
+            root = xml.etree.ElementTree.fromstring(message)
+        except xml.etree.ElementTree.ParseError:
+            _LOGGER.warning(f"Ignoring unreadable message from the module: {message!r}")
+            return
 
         # Check if the message is a discovery response
         if root.findtext("response") == "discovery":
@@ -286,16 +292,36 @@ class Hub:
 
             self.available = True
             self._ready = True
+            self._log_summary()
+            if root.findtext("response") == "getzoneinfo":
+                self._zone_refreshed.set()
             self._hass.loop.create_task(self.publish_updates())
 
         # Check if the message is postzoneinfo result 'ok'
         elif (root.findtext("response") == "postzoneinfo" and
                 root.findtext("result") == "ok"):
 
-            self._postzoneinfo_response_ok = True
+            self._post_acked.set()
             _LOGGER.info("Sending getzoneinfo")
             _LOGGER.debug(f"Sending: {XML_GETZONEINFO}")
             self._server_transport.write(XML_GETZONEINFO.encode())
+
+    def _log_summary(self):
+        """Log what the unit says its state is (INFO when it changes, DEBUG otherwise)."""
+        z = self._zone_info
+        summary = ", ".join(f"{k}={z.get(k)}" for k in
+                            ("system", "type", "mode", "setPoint", "fanSpeed", "zoneList", "roomTemp"))
+        level = logging.DEBUG if summary == self._last_summary else logging.INFO
+        self._last_summary = summary
+        _LOGGER.log(level, f"Unit reports: {summary}")
+
+    def _command_applied(self, command):
+        """True if the unit's reported state matches every setting in the command.
+
+        Settings the unit does not report back cannot be checked and are ignored.
+        """
+        return all(str(self._zone_info.get(key)) == str(value)
+                   for key, value in command.items() if key in self._zone_info)
 
     def server_connection_lost(self):
         _LOGGER.debug("Server connection lost")
@@ -374,38 +400,64 @@ class Hub:
         await self.async_send_commands(command)
 
     async def async_send_commands(self, command):
-        """Send commands to device."""
+        """Send commands to device.
+
+        Each command is sent, the unit's acknowledgement is waited for, and then the
+        unit's reported state is checked to see that it really took the change.  If
+        either is missing the command is sent again (up to 3 times in total).
+        """
         _LOGGER.info(command)
         # Append the given command to the end of the queued commands
         self._queued_commands.append(command)
 
         if len(self._queued_commands) == 1:
-        
-            while len(self._queued_commands) > 0:
 
-                # Wait until ready to send commands
-                while not self._ready:
-                    await asyncio.sleep(1)
+            try:
+                while len(self._queued_commands) > 0:
+                    await self._async_send_one(self._queued_commands[0])
+                    self._queued_commands.pop(0)
+            finally:
+                # Never leave stale commands behind: a non-empty queue blocks all later sends
+                self._queued_commands.clear()
 
-                command = self._queued_commands[0]
+    async def _async_send_one(self, command):
+        """Send one command and make sure the unit applied it."""
+        postzoneinfo = "<myclimate><post>postzoneinfo</post>"
+        for key, value in command.items():
+            postzoneinfo += f"<{key}>{value}</{key}>"
+        postzoneinfo += "</myclimate>"
 
-                postzoneinfo = "<myclimate><post>postzoneinfo</post>"
-                for key, value in command.items():
-                    postzoneinfo += f"<{key}>{value}</{key}>"
-                postzoneinfo += "</myclimate>"
+        for attempt in range(3):
+            # Wait until ready to send commands (the connection is re-made every few minutes)
+            while not self._ready:
+                await asyncio.sleep(1)
 
-                # Attempt to send the command up to 3 times
-                for attempts in range(3):
-                    if attempts > 0:
-                        _LOGGER.info("Response not received, resending postzoneinfo")
-                    else:
-                        _LOGGER.info("Sending postzoneinfo")
-                    _LOGGER.debug(f"Sending: {postzoneinfo}")
-                    self._server_transport.write(postzoneinfo.encode())
+            if attempt > 0:
+                _LOGGER.info("Resending postzoneinfo")
+            else:
+                _LOGGER.info("Sending postzoneinfo")
+            _LOGGER.debug(f"Sending: {postzoneinfo}")
 
-                    await asyncio.sleep(3)
-                    if self._postzoneinfo_response_ok: break
-                else:
-                    _LOGGER.warning("No postzoneinfo response received after 3 attempts, aborting")
+            self._post_acked.clear()
+            self._zone_refreshed.clear()
+            try:
+                self._server_transport.write(postzoneinfo.encode())
+            except (AttributeError, OSError) as err:
+                _LOGGER.warning(f"Could not send postzoneinfo: {err}")
+                await asyncio.sleep(3)
+                continue
 
-                self._queued_commands.pop(0)
+            # The unit acknowledges the post, then we ask for its state (see server_data_received)
+            try:
+                await asyncio.wait_for(self._post_acked.wait(), 4)
+                await asyncio.wait_for(self._zone_refreshed.wait(), 5)
+            except asyncio.TimeoutError:
+                _LOGGER.info("Response not received from the module")
+                continue
+
+            if self._command_applied(command):
+                return
+            _LOGGER.info("The module acknowledged the command but reports a different state")
+
+        _LOGGER.warning(f"The module did not apply {command} after 3 attempts; it reports: "
+                        f"{self._last_summary}")

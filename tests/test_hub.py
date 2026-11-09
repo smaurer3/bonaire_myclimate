@@ -8,6 +8,7 @@ import os
 import sys
 import types
 import unittest
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "custom_components", "bonaire_myclimate"))
@@ -83,6 +84,128 @@ class HubDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hub._known_hosts(), ["127.0.0.2", "127.0.0.9"])
         self.hub.configured_host = None
         self.assertEqual(self.hub._known_hosts(), ["127.0.0.9"])
+
+
+class ProtocolUnit(test_discovery.FakeUnit):
+    """A module that speaks the whole protocol, and can be told to misbehave with commands."""
+
+    def __init__(self, ip):
+        super().__init__(ip)
+        self.state = dict(system="off", type="evap", mode="thermo", setPoint="5",
+                          fanSpeed="3", roomTemp="21", zoneList="1")
+        self.posts = []        # every postzoneinfo received, as a dict
+        self.drop_posts = 0    # ignore this many posts (no acknowledgement at all)
+        self.ignore_posts = 0  # acknowledge this many posts but do not apply them
+
+    def _xml(self, **fields):
+        return "<myclimate>" + "".join(f"<{k}>{v}</{k}>" for k, v in fields.items()) + "</myclimate>"
+
+    async def _connect_back(self, ip):
+        reader, writer = await asyncio.open_connection(ip, test_discovery.TCP_PORT, local_addr=(self.ip, 0))
+        writer.write(test_discovery.RESPONSE.format(ip=self.ip).encode())
+        await writer.drain()
+        buffer = ""
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                break
+            buffer += data.decode()
+            while "</myclimate>" in buffer:
+                message, buffer = buffer.split("</myclimate>", 1)
+                message += "</myclimate>"
+                if "delete" in message:
+                    self.received_delete.set()
+                    writer.close()
+                    return
+                reply = self._reply(message)
+                if reply:
+                    writer.write(reply.encode())
+                    await writer.drain()
+        writer.close()
+
+    def _reply(self, message):
+        root = ET.fromstring(message)
+        if root.findtext("get") == "installation":
+            return ("<myclimate><response>installation</response>"
+                    "<appliance><type>heat</type><zoneList/></appliance>"
+                    "<appliance><type>cool</type><zoneList/></appliance>"
+                    "<appliance><type>evap</type><zoneList>1</zoneList></appliance></myclimate>")
+        if root.findtext("get") == "getzoneinfo":
+            return self._xml(response="getzoneinfo", **self.state)
+        if root.findtext("post") == "postzoneinfo":
+            post = {c.tag: c.text for c in root if c.tag != "post"}
+            self.posts.append(post)
+            if self.drop_posts > 0:
+                self.drop_posts -= 1
+                return None
+            if self.ignore_posts > 0:
+                self.ignore_posts -= 1
+            else:
+                self.state.update(post)
+            return self._xml(response="postzoneinfo", result="ok")
+        return None
+
+
+class HubCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._old_ports = (test_discovery.UDP_PORT, test_discovery.TCP_PORT)
+        test_discovery.UDP_PORT, test_discovery.TCP_PORT = 10001, 10003
+        self.unit = ProtocolUnit("127.0.0.2")
+        await self.unit.start()
+        hass = types.SimpleNamespace(loop=asyncio.get_running_loop())
+        self.hub = hub_module.Hub(hass, "127.0.0.1", host="127.0.0.2")
+        for _ in range(100):
+            if self.hub._ready:
+                break
+            await asyncio.sleep(0.1)
+        self.assertTrue(self.hub._ready)
+
+    async def asyncTearDown(self):
+        await self.hub.async_teardown()
+        await self.unit.stop()
+        test_discovery.UDP_PORT, test_discovery.TCP_PORT = self._old_ports
+
+    async def test_command_is_sent_once_and_applied(self):
+        await self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"})
+        self.assertEqual(len(self.unit.posts), 1)
+        self.assertEqual(self.unit.state["system"], "on")
+        self.assertEqual(self.hub.hvac_mode, "cool")
+
+    async def test_unacknowledged_command_is_resent(self):
+        self.unit.drop_posts = 1
+        await self.hub.async_send_commands({"system": "on"})
+        self.assertEqual(len(self.unit.posts), 2)
+        self.assertEqual(self.unit.state["system"], "on")
+
+    async def test_acknowledged_but_not_applied_command_is_resent(self):
+        self.unit.ignore_posts = 1
+        await self.hub.async_send_commands({"system": "on"})
+        self.assertEqual(len(self.unit.posts), 2)
+        self.assertEqual(self.unit.state["system"], "on")
+
+    async def test_resend_still_works_after_an_earlier_success(self):
+        # the old code remembered the first acknowledgement forever and never resent again
+        await self.hub.async_send_commands({"system": "on"})
+        self.unit.drop_posts = 1
+        await self.hub.async_send_commands({"setPoint": "7", "mode": "thermo"})
+        self.assertEqual(len(self.unit.posts), 3)
+        self.assertEqual(self.unit.state["setPoint"], "7")
+
+    async def test_gives_up_after_three_attempts_and_keeps_working(self):
+        self.unit.ignore_posts = 3
+        await self.hub.async_send_commands({"system": "on"})
+        self.assertEqual(len(self.unit.posts), 3)
+        self.assertEqual(self.hub._queued_commands, [])
+        await self.hub.async_send_commands({"system": "on"})  # queue is not wedged
+        self.assertEqual(self.unit.state["system"], "on")
+
+    async def test_back_to_back_commands_are_sent_in_order(self):
+        await asyncio.gather(
+            self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"}),
+            self.hub.async_send_commands({"setPoint": 6, "mode": "thermo"}),
+        )
+        self.assertEqual([p.get("setPoint") for p in self.unit.posts], [None, "6"])
+        self.assertEqual((self.unit.state["system"], self.unit.state["setPoint"]), ("on", "6"))
 
 
 if __name__ == "__main__":
