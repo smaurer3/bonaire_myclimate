@@ -5,6 +5,7 @@ import xml.etree.ElementTree
 
 from homeassistant.components.climate.const import ClimateEntityFeature, HVACMode
 
+from .discovery import async_send_sweep, async_send_unicast
 from .helpers import (
     create_datagram_transport, create_server, zone_combinations
 )
@@ -19,10 +20,21 @@ _LOGGER = logging.getLogger(__name__)
 class Hub:
     """Hub for Bonaire MyClimate."""
 
-    def __init__(self, hass, local_ip):
-        """Init hub."""
+    def __init__(self, hass, local_ip, host=None, last_host=None, network=None,
+                 on_host_found=None):
+        """Init hub.
+
+        host          -- IP address the user configured, or None to find the module automatically.
+        last_host     -- IP address the module last connected back from.
+        network       -- ipaddress.IPv4Network to sweep when the module cannot be found.
+        on_host_found -- called with the module's IP address whenever it connects from a new one.
+        """
         self._hass = hass
         self._local_ip = local_ip
+        self.configured_host = host or None
+        self._last_host = last_host or None
+        self._network = network
+        self._on_host_found = on_host_found
 
         self._appliances = {}
         self._callbacks = set()
@@ -37,6 +49,7 @@ class Hub:
         self._zone_info = {}
 
         self._server_transport = None
+        self._tcp_server = None
         self._udp_transport = None
 
         # Properties
@@ -60,7 +73,8 @@ class Hub:
             self._start_task.cancel()
 
         # Close the UDP client
-        self._udp_transport.close()
+        if self._udp_transport is not None:
+            self._udp_transport.close()
 
         # Send the delete request
         if self._server_transport is not None:
@@ -69,8 +83,13 @@ class Hub:
             self._server_transport.write(XML_DELETE.encode())
 
         # Close the TCP listener
-        self._tcp_server.close()
-        await self._tcp_server.wait_closed()
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+
+    def _known_hosts(self):
+        """IP addresses to send discovery to directly: configured first, then last seen."""
+        return [h for h in dict.fromkeys([self.configured_host, self._last_host]) if h]
 
     async def async_start(self):
         """Connects to the Wi-Fi module."""
@@ -110,6 +129,19 @@ class Hub:
                 _LOGGER.debug(f"Sending: {xml_discovery}")
                 self._udp_transport.sendto(xml_discovery.encode())
 
+                # The module's Wi-Fi often misses broadcasts, so also send discovery
+                # straight to the address(es) it is known to have.
+                known_hosts = self._known_hosts()
+                if known_hosts:
+                    _LOGGER.debug(f"Sending discovery to {known_hosts}")
+                    await async_send_unicast(self._local_ip, known_hosts)
+
+                # Still not found after a few tries (e.g. its address changed): try every
+                # address on the subnet, then again every fifth attempt.
+                if self._network is not None and attempts >= 3 and (attempts - 3) % 5 == 0:
+                    _LOGGER.info(f"Module not found, scanning {self._network} for it")
+                    await async_send_sweep(self._local_ip, self._network)
+
                 # Wait for 10 seconds for a response to the discovery broadcast
                 await asyncio.sleep(10)
 
@@ -140,6 +172,14 @@ class Hub:
     def server_connection_made(self, transport):
         _LOGGER.info("Connected to the Bonaire MyClimate Wi-Fi device")
         self._server_transport = transport
+
+        # Remember where the module is, so discovery can go straight to it next time
+        peer = transport.get_extra_info("peername")
+        if peer and peer[0] != self._last_host:
+            self._last_host = peer[0]
+            _LOGGER.info(f"Module is at {self._last_host}")
+            if self._on_host_found is not None:
+                self._on_host_found(self._last_host)
 
     def server_data_received(self, data):
         message = data.decode()

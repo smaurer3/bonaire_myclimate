@@ -20,7 +20,22 @@ After you have installed the custom component (see above):
 1. Goto the `Configuration` -> `Integrations` page.  
 2. On the bottom right of the page, click on the `+ Add Integration` sign to add an integration.
 3. Search for `Bonaire MyClimate`. (If you don't see it, try refreshing your browser page to reload the cache.)
-4. Click `Submit` so add the integration.
+4. Either enter the module's IP address, or leave it blank and click `Submit` to scan your network for it (it will ask you to confirm what it finds).
+
+### Finding the module / changing its IP address
+
+The module is normally found by a UDP broadcast, but on many Wi-Fi networks the module misses broadcasts (it answers a message sent straight to its own IP immediately). This version therefore:
+
+- sends discovery directly to the module's known IP address (the one you entered, or the one it last connected from) as well as broadcasting,
+- scans every address on the subnet if the module still cannot be found, for example because its IP address changed, and remembers the new address,
+- lets you change the IP address later: `Settings` -> `Devices & services` -> `Bonaire MyClimate` -> `Configure`. Leave it blank to find the module automatically.
+
+Giving the module a fixed address (a DHCP reservation on your router) is still the most reliable setup.
+
+## Development
+
+The discovery code has no Home Assistant dependency and is tested against a simulated module (Linux/macOS):
+`python3 -m unittest discover -s tests -v`
 
 ## Troubleshooting
 

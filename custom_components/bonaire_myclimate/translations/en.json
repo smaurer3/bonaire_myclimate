@@ -1,12 +1,40 @@
 {
   "config": {
-    "abort": {
-      "single_instance_allowed": "Already configured. Only a single instance is allowed."
-    },
     "step": {
       "user": {
-        "description": "Set up the Bonaire MyClimate integration."
+        "title": "Bonaire MyClimate",
+        "description": "Enter the IP address of the MyClimate Wi-Fi module, or leave it blank to scan your network for it. Giving the module a fixed address (a DHCP reservation on your router) keeps things reliable.",
+        "data": {
+          "host": "IP address (optional)"
+        }
+      },
+      "confirm": {
+        "title": "Module found",
+        "description": "Found a MyClimate Wi-Fi module at {host} (serial {serial}). Add it?"
       }
+    },
+    "error": {
+      "invalid_host": "That is not a valid IPv4 address.",
+      "cannot_connect": "The module did not answer at that address. Check the address, that the module is powered, and that it is on the same network as Home Assistant.",
+      "not_found": "No MyClimate module answered the network scan. Check it is powered and on the same network as Home Assistant, or enter its IP address.",
+      "port_in_use": "TCP port 10003 is already in use on this Home Assistant host."
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured. Only a single instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Bonaire MyClimate",
+        "description": "The IP address of the MyClimate Wi-Fi module. Leave it blank to find the module automatically. If the module changes address, Home Assistant will scan the network and find it again.",
+        "data": {
+          "host": "IP address (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_host": "That is not a valid IPv4 address."
     }
   }
 }
