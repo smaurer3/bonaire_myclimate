@@ -208,5 +208,58 @@ class HubCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.unit.state["system"], self.unit.state["setPoint"]), ("on", "6"))
 
 
+    def stale_report(self, **fields):
+        """A getzoneinfo answer that was already on its way before the command was sent."""
+        state = dict(self.unit.state)
+        state.update(fields)
+        self.hub.server_data_received(self.unit._xml(response="getzoneinfo", **state).encode())
+
+    async def test_pending_command_is_shown_before_the_unit_confirms(self):
+        task = asyncio.ensure_future(
+            self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"}))
+        await asyncio.sleep(0)
+        self.assertEqual(self.hub.hvac_mode, "cool")  # not waiting for the unit's reply
+        await task
+        self.assertEqual(self.hub.hvac_mode, "cool")
+
+    async def test_stale_report_does_not_undo_a_pending_command(self):
+        # The cooling defaults + helper automations read the entity and write it back about two
+        # seconds later; a stale value reported meanwhile made them undo each other.
+        await self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"})
+        self.assertEqual(self.hub.fan_mode, "5")
+        task = asyncio.ensure_future(self.hub.async_send_commands({"setPoint": 7, "mode": "thermo"}))
+        await asyncio.sleep(0)
+        self.assertEqual(self.hub.fan_mode, "7")
+        self.stale_report(setPoint="5")
+        self.assertEqual(self.hub.fan_mode, "7")
+        await task
+        self.assertEqual(self.unit.state["setPoint"], "7")
+        self.assertEqual(self.hub.fan_mode, "7")
+
+    async def test_entity_follows_the_unit_again_once_a_command_is_finished(self):
+        await self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"})
+        await self.hub.async_send_commands({"setPoint": 7, "mode": "thermo"})
+        self.stale_report(setPoint="4")  # e.g. changed at the unit's own panel
+        self.assertEqual(self.hub.fan_mode, "4")
+
+    async def test_entity_shows_what_the_unit_reports_when_it_never_applies_a_command(self):
+        self.unit.ignore_posts = 3
+        await self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"})
+        self.assertEqual(self.hub.hvac_mode, "off")
+        self.assertEqual(self.hub._queued_commands, [])
+
+    async def test_cancelled_caller_does_not_abandon_the_queue(self):
+        # an automation in "restart" mode cancels its service call when it is triggered again
+        first = asyncio.ensure_future(
+            self.hub.async_send_commands({"system": "on", "type": "evap", "mode": "thermo"}))
+        await asyncio.sleep(0)
+        second = asyncio.ensure_future(self.hub.async_send_commands({"setPoint": 7, "mode": "thermo"}))
+        await asyncio.sleep(0)
+        first.cancel()
+        await second
+        self.assertEqual((self.unit.state["system"], self.unit.state["setPoint"]), ("on", "7"))
+        self.assertEqual(self.hub._queued_commands, [])
+
+
 if __name__ == "__main__":
     unittest.main()

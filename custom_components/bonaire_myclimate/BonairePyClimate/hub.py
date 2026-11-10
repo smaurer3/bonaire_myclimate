@@ -46,9 +46,11 @@ class Hub:
         self._post_acked = asyncio.Event()  # unit answered our postzoneinfo with result ok
         self._zone_refreshed = asyncio.Event()  # unit answered our getzoneinfo
         self._queued_commands = []
+        self._queue_task = None  # works through _queued_commands, independent of who asked
         self._ready = False # Ready to send commands
         self._start_task = None
-        self._zone_info = {}
+        self._reported = {}   # what the unit last told us
+        self._zone_info = {}  # what we show: _reported with the commands still on their way applied
 
         self._server_transport = None
         self._tcp_server = None
@@ -73,6 +75,8 @@ class Hub:
         # Cancel the main loop
         if self._start_task is not None:
             self._start_task.cancel()
+        if self._queue_task is not None:
+            self._queue_task.cancel()
 
         # Close the UDP client
         if self._udp_transport is not None:
@@ -238,57 +242,11 @@ class Hub:
                 root.findtext("post") == "postzoneinfo"):
 
             # Save all the hvac zone info
-            self._zone_info = {}
+            self._reported = {}
             for item in root.iterfind("./"):
-                self._zone_info[item.tag] = item.text
-
-            # Process the zone info, build the hvac properties
-            if self._zone_info["system"] == "off":
-                self.hvac_mode = HVACMode.OFF
-            elif self._zone_info["mode"] == "fan":
-                self.fan_mode = self._zone_info["fanSpeed"]
-                self.fan_modes = FAN_MODES_FAN_ONLY
-                self.hvac_mode = HVACMode.FAN_ONLY
-                if self._zone_info["type"] == "heat":
-                    self.preset_modes = self._preset_modes_heat
-                else:
-                    self.preset_modes = self._preset_modes_cool
-                self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
-            elif self._zone_info["type"] == "heat":
-                self._fan_mode_memory_heat = self._zone_info["mode"]
-                self.fan_mode = self._zone_info["mode"]
-                self.fan_modes = FAN_MODES_HEAT
-                self.hvac_mode = HVACMode.HEAT
-                self.preset_modes = self._preset_modes_heat
-                self.supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
-                self.target_temperature = int(self._zone_info["setPoint"])
-            elif self._zone_info["type"] == "cool":
-                self.fan_mode = self._zone_info["mode"]
-                self.fan_modes = FAN_MODES_COOL
-                self.hvac_mode = HVACMode.COOL
-                self.preset_modes = self._preset_modes_cool
-                self.supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
-                self.target_temperature = int(self._zone_info["setPoint"])
-            elif self._zone_info["type"] == "evap" and self._zone_info["mode"] == "thermo":
-                self._fan_mode_memory_evap = "thermo"
-                self.fan_mode = self._zone_info["setPoint"]
-                self.fan_modes = FAN_MODES_EVAP
-                self.hvac_mode = HVACMode.COOL
-                self.preset_modes = ["thermo", "manual", "boost"]
-                self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
-            elif self._zone_info["type"] == "evap":
-                self._fan_mode_memory_evap = self._zone_info["mode"]
-                self.fan_mode = self._zone_info["fanSpeed"]
-                self.fan_modes = FAN_MODES_EVAP
-                self.hvac_mode = HVACMode.COOL
-                self.preset_modes = ["thermo", "manual", "boost"]
-                self.supported_features = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
-
-            self.current_temperature = int(self._zone_info["roomTemp"])
-            if self._zone_info.get("type") == "evap":
-                self.preset_mode = self._zone_info["mode"]
-            else:
-                self.preset_mode = self._zone_info["zoneList"]
+                self._reported[item.tag] = item.text
+            self._remember_modes(self._reported)
+            self._rebuild_state()
 
             self.available = True
             self._ready = True
@@ -306,9 +264,94 @@ class Hub:
             _LOGGER.debug(f"Sending: {XML_GETZONEINFO}")
             self._server_transport.write(XML_GETZONEINFO.encode())
 
+    def _remember_modes(self, z):
+        """Remember the last heat / evap mode, so turning the system on again can restore it."""
+        if z.get("system") == "off" or z.get("mode") == "fan":
+            return
+        if z.get("type") == "heat":
+            self._fan_mode_memory_heat = z["mode"]
+        elif z.get("type") == "evap":
+            self._fan_mode_memory_evap = z["mode"]
+
+    def _properties_from(self, z):
+        """The climate properties for a given zone info (raises KeyError if it is incomplete)."""
+        props = {}
+        if z["system"] == "off":
+            props["hvac_mode"] = HVACMode.OFF
+        elif z["mode"] == "fan":
+            props["fan_mode"] = z["fanSpeed"]
+            props["fan_modes"] = FAN_MODES_FAN_ONLY
+            props["hvac_mode"] = HVACMode.FAN_ONLY
+            if z["type"] == "heat":
+                props["preset_modes"] = self._preset_modes_heat
+            else:
+                props["preset_modes"] = self._preset_modes_cool
+            props["supported_features"] = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
+        elif z["type"] == "heat":
+            props["fan_mode"] = z["mode"]
+            props["fan_modes"] = FAN_MODES_HEAT
+            props["hvac_mode"] = HVACMode.HEAT
+            props["preset_modes"] = self._preset_modes_heat
+            props["supported_features"] = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
+            props["target_temperature"] = int(z["setPoint"])
+        elif z["type"] == "cool":
+            props["fan_mode"] = z["mode"]
+            props["fan_modes"] = FAN_MODES_COOL
+            props["hvac_mode"] = HVACMode.COOL
+            props["preset_modes"] = self._preset_modes_cool
+            props["supported_features"] = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
+            props["target_temperature"] = int(z["setPoint"])
+        elif z["type"] == "evap" and z["mode"] == "thermo":
+            props["fan_mode"] = z["setPoint"]
+            props["fan_modes"] = FAN_MODES_EVAP
+            props["hvac_mode"] = HVACMode.COOL
+            props["preset_modes"] = ["thermo", "manual", "boost"]
+            props["supported_features"] = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
+        elif z["type"] == "evap":
+            props["fan_mode"] = z["fanSpeed"]
+            props["fan_modes"] = FAN_MODES_EVAP
+            props["hvac_mode"] = HVACMode.COOL
+            props["preset_modes"] = ["thermo", "manual", "boost"]
+            props["supported_features"] = ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
+
+        props["current_temperature"] = int(z["roomTemp"])
+        if z.get("type") == "evap":
+            props["preset_mode"] = z["mode"]
+        else:
+            props["preset_mode"] = z["zoneList"]
+        return props
+
+    def _rebuild_state(self):
+        """Set the climate properties: what the unit reports, plus the commands on their way to it.
+
+        A command that has been given to us but that the unit has not yet confirmed is shown as
+        already applied.  Otherwise a report that was already on its way when the command was sent
+        puts the old value back for a few seconds, and automations that copy the entity to a helper
+        and write it back (as the cooling defaults do) then send that stale value and undo the
+        command.  Once the unit has confirmed the command, or we have given up on it, the entity
+        simply shows what the unit reports.
+        """
+        view = dict(self._reported)
+        for command in self._queued_commands:
+            view.update({key: str(value) for key, value in command.items()})
+
+        props = None
+        if view != self._reported:
+            try:
+                props = self._properties_from(view)
+            except (KeyError, ValueError, TypeError):
+                # Not enough is known to show the pending command (e.g. nothing reported yet)
+                view = dict(self._reported)
+        if props is None:
+            props = self._properties_from(view)
+
+        self._zone_info = view
+        for name, value in props.items():
+            setattr(self, name, value)
+
     def _log_summary(self):
         """Log what the unit says its state is (INFO when it changes, DEBUG otherwise)."""
-        z = self._zone_info
+        z = self._reported
         summary = ", ".join(f"{k}={z.get(k)}" for k in
                             ("system", "type", "mode", "setPoint", "fanSpeed", "zoneList", "roomTemp"))
         level = logging.DEBUG if summary == self._last_summary else logging.INFO
@@ -320,8 +363,8 @@ class Hub:
 
         Settings the unit does not report back cannot be checked and are ignored.
         """
-        return all(str(self._zone_info.get(key)) == str(value)
-                   for key, value in command.items() if key in self._zone_info)
+        return all(str(self._reported.get(key)) == str(value)
+                   for key, value in command.items() if key in self._reported)
 
     def server_connection_lost(self):
         _LOGGER.debug("Server connection lost")
@@ -409,16 +452,34 @@ class Hub:
         _LOGGER.info(command)
         # Append the given command to the end of the queued commands
         self._queued_commands.append(command)
+        self._show_pending_commands()
 
-        if len(self._queued_commands) == 1:
+        # The queue is worked through by its own task, so a caller that is cancelled (e.g. an
+        # automation in "restart" mode) does not abandon the commands still waiting.
+        if self._queue_task is None or self._queue_task.done():
+            self._queue_task = self._hass.loop.create_task(self._async_send_queued())
+        await asyncio.shield(self._queue_task)
 
-            try:
-                while len(self._queued_commands) > 0:
-                    await self._async_send_one(self._queued_commands[0])
-                    self._queued_commands.pop(0)
-            finally:
-                # Never leave stale commands behind: a non-empty queue blocks all later sends
-                self._queued_commands.clear()
+    async def _async_send_queued(self):
+        """Send the queued commands one after another."""
+        try:
+            while len(self._queued_commands) > 0:
+                await self._async_send_one(self._queued_commands[0])
+                self._queued_commands.pop(0)
+                self._show_pending_commands()
+        finally:
+            # Never leave stale commands behind: a non-empty queue blocks all later sends
+            self._queued_commands.clear()
+            self._show_pending_commands()
+
+    def _show_pending_commands(self):
+        """Update the entity for a change in the commands that are waiting for the unit."""
+        if not self._reported:
+            return  # nothing known about the unit yet
+        before = self._zone_info
+        self._rebuild_state()
+        if self._zone_info != before:
+            self._hass.loop.create_task(self.publish_updates())
 
     async def _async_send_one(self, command):
         """Send one command and make sure the unit applied it."""

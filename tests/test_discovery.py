@@ -34,6 +34,7 @@ class FakeUnit:
         self._sock.bind(("0.0.0.0" if answer_broadcast else ip, UDP_PORT))
         self._sock.setblocking(False)
         self._task = None
+        self._connections = set()  # asyncio only holds tasks weakly: keep them alive
 
     async def start(self):
         self._task = asyncio.get_running_loop().create_task(self._run())
@@ -45,7 +46,9 @@ class FakeUnit:
             m = re.search(rb"<ip>([^<]*)</ip>", data)
             if not m:
                 continue
-            asyncio.get_running_loop().create_task(self._connect_back(m.group(1).decode()))
+            task = asyncio.get_running_loop().create_task(self._connect_back(m.group(1).decode()))
+            self._connections.add(task)
+            task.add_done_callback(self._connections.discard)
 
     async def _connect_back(self, ip):
         reader, writer = await asyncio.open_connection(ip, TCP_PORT, local_addr=(self.ip, 0))
@@ -63,6 +66,8 @@ class FakeUnit:
 
     async def stop(self):
         self._task.cancel()
+        for task in list(self._connections):
+            task.cancel()
         self._sock.close()
 
 
